@@ -1,0 +1,535 @@
+---
+title: "Cell-cell communication analysis in CosMX data"
+output:
+  html_document:
+    df_print: paged
+---
+
+**Useful links:**
+
+[Main cell-chat tutorials](https://github.com/jinworks/CellChat){.uri}
+
+[Different spatial technology transformations](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/FAQ_on_applying_CellChat_to_spatial_transcriptomics_data.html)
+
+[Running on single dataset](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/CellChat_analysis_of_spatial_transcriptomics_data.html)
+
+[Running on multiple spatial datasets, for comparisons](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/CellChat_analysis_of_multiple_spatial_transcriptomics_datasets.html)
+
+[Every figure possible in cell chat explained](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/CellChat-vignette.html)
+
+## Preparation
+
+```{r setup, include = FALSE}
+#knitr::opts_chunk$set(eval = FALSE)
+
+```
+
+Downloading CellChat is tricky because they don't force dependencies to be loaded, so you have to figure out the dependencies that your environment does not have and download them first.
+
+This could be easily achieved with a conda environment, however cellchat itself does not have a conda package.
+
+```{r}
+# devtools::install_github("jinworks/CellChat") 
+# devtools::install_github('immunogenomics/presto')
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(CellChat)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(presto)
+library(NMF)
+library(ggalluvial)
+```
+
+```{r}
+
+setwd("/home/fs01/elo4010")
+cancer <- readRDS("cancer_c18fov5.rds") #this is 1 fov
+```
+
+This is the FOV we are working with:
+
+```{r}
+ImageDimPlot(cancer, fov= "C18.fov5", border.size=0.1, group.by="immune_clusters_specific")
+```
+
+## Running on single object
+
+In this tutorial we are creating the CellChat object using our spatial Seurat object. For other types of data please see the original tutorial.
+
+### Creating the cell chat object
+
+```{r}
+
+Idents(cancer) <- cancer@meta.data$immune_clusters_specific #need to get the cell types 
+data.input = GetAssayData(cancer, slot = "data", assay = "RNA_norm") # normalized data matrix
+
+# for spatial locations we get centroids
+meta = data.frame(labels = Idents(cancer), row.names = names(Idents(cancer)))
+spatial.locs <- data.frame(
+  x = cancer@meta.data$CenterX_global_px,
+  y = cancer@meta.data$CenterY_global_px
+)
+rownames(spatial.locs) <- rownames(cancer@meta.data)
+
+# this part needs to be obtained from the link listed above for different technologies, this is given for CosMX since it uses pixels. You don't have to use this if your CosMX data already has coordinates in microns.
+
+conversion.factor = 0.18
+d = computeCellDistance(spatial.locs)
+spot.size = min(d)*conversion.factor # converting the distance in Pixels to Micrometers
+spatial.factors = data.frame(ratio = conversion.factor, tol = spot.size/2)
+```
+
+```{r}
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels",
+                           datatype = "spatial", coordinates = spatial.locs, spatial.factors=spatial.factors)
+
+```
+
+Now we have successfully created our cell chat object.
+
+### Choosing the ligand-receptor database
+
+Cellchat has a manually curated database from literature for ligand-receptor interactions both in human and mice. There are 4 types of the ligand-receptor pairings.
+
+The non-protein signaling includes metabolic and synaptic signaling that they use gene expression data to infer.
+
+```{r}
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+```
+
+```{r}
+#CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling, single category selected 
+
+CellChatDB.use <- subsetDB(CellChatDB) # all categories except for non-protein signaling 
+
+# you have to either choose one category at each time or use the full version, add the non-protein signaling if you are interested. Here we will continue with the secreted signaling first. 
+
+cellchat@DB <- CellChatDB.use
+cellchat <- subsetData(cellchat) # subsetting for the specific gene set selected 
+```
+
+```{r}
+# you need presto library to run these functions
+future::plan("multisession", workers = 2) 
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = F)
+```
+
+### Creating cell-cell communication network
+
+CellChat predicts the likelihood of communication between cells by analyzing which signaling molecules (ligands) are produced by one cell and which receptor molecules are present on another. This prediction is based on known biological interactions: if a cell produces a ligand and a neighboring cell has the matching receptor, they're likely to communicate.
+
+Using the **law of mass action**, CellChat models this interaction strength: higher levels of ligands and receptors mean a stronger predicted chance of communication. It's like calculating the potential for a chemical reaction where the presence and amount of each component (ligands, receptors, and cofactors) increase the probability of successful cell-to-cell communication.
+
+With this being said, it highly depends on the method of calculating the average gene expression per cell group. By default, CellChat uses a robust averaging method called the "trimean," which tends to predict fewer, stronger interactions, making it useful for focusing on interactions likely worth experimental validation. In `computeCommunProb`, you can also select other methods, like a 10% truncated mean, by setting `type = "truncatedMean"` and `trim = 0.1` to adjust the averaging. The trimean roughly corresponds to a **25% truncated mean, meaning the average gene expression is zero if less than 25% of cells in a group express the gene. We will set trim to be 0.1, since 25% of cells expressing same gene within broad cell types in a spatial FOV is a very stringent approach.**
+
+The parameters for the following function does change for different spatial technologies. Either `contact.knn.k` or `contact.range` is used. **For contact range, if the data is similar to 10X visium (low-resolution) it should be equal to the cell center-to-center distance which is 100.** The function `computeCellDistance` can be used to calculate any technology.
+
+Example: If `interaction.range` is 10 microns and `tol` is 5 microns, CellChat will consider cells within 10-15 microns as potential interaction pairs.
+
+Following function calculates the `scale.distance` within and reports the number, here I am already using the reported number.
+
+```{r, eval=FALSE}
+cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1,
+                              distance.use = TRUE, interaction.range = 250, 
+                              scale.distance = 4.5,
+                              contact.dependent = TRUE, contact.range = 20)
+```
+
+```{r, eval=FALSE}
+
+#Save the object incase anything goes wrong and you have to restart the session since the previous step takes too long 
+
+saveRDS(cellchat, file = "C18_fov5_cellchat_allpathways.rds")
+```
+
+```{r}
+cellchat <- readRDS("C18_fov5_cellchat_allpathways.rds")
+```
+
+```{r}
+cellchat <- filterCommunication(cellchat, min.cells = 10) # This filter requires minimum of 10 cells per cell type
+```
+
+### Post-processing of cell-cell communication network
+
+-   `df.net <- subsetCommunication(cellchat)` returns a data frame consisting of all the inferred cell-cell communications at the level of ligands/receptors. Set `slot.name = "netP"` to access the the inferred communications at the level of signaling pathways
+
+-   `df.net <- subsetCommunication(cellchat, sources.use = c(1,2), targets.use = c(4,5))` gives the inferred cell-cell communications sending from cell groups 1 and 2 to cell groups 4 and 5.
+
+-   `df.net <- subsetCommunication(cellchat, signaling = c("WNT", "TGFb"))` gives the inferred cell-cell communications mediated by signaling WNT and TGFb.
+
+-   Communication probabilities can be also calculated for signaling pathways using the ligand-receptor interactions associated with each signaling pathway. `cellchat <-computeCommunProbPathway(cellchat)`
+
+-   Aggregated cell-cell communication can be used to show all cell-type interactions in one figure. `cellchat <- aggregateNet(cellchat)`
+
+The subsetting function can be used to plotting the data ourselves without using Cellchat or manually exploring it. However, the rest of the functions are used to plot the communication networks using CellChat.
+
+```{r}
+df.net <- subsetCommunication(cellchat)
+head(df.net)
+```
+
+```{r}
+ cellchat <-computeCommunProbPathway(cellchat)
+ cellchat <- aggregateNet(cellchat)
+```
+
+### Plotting cell-cell communication data
+
+#### Plotting interaction strength/count between cell types
+
+The first plot we will look at summarizes the interaction network in our data. The two variables we plot represents different things:
+
+|                            |                                |                                   |
+|----------------------|------------------------|--------------------------|
+| **Number of Interactions** | Count of ligand-receptor pairs | Extent of potential communication |
+
+|                                 |                                  |                                            |
+|----------------------|----------------------|----------------------------|
+| **Interaction Weight/Strength** | Sum of interaction probabilities | Intensity or significance of communication |
+
+```{r, fig.width=10, fig.show='hold'}
+groupSize <- as.numeric(table(cellchat@idents))
+
+par(mfrow = c(1,2), xpd=TRUE)
+
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = TRUE, label.edge = FALSE, title.name = "Number of interactions", vertex.label.cex = 0.8)
+
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = TRUE, label.edge = FALSE, title.name = "Interaction weights/strength", vertex.label.cex = 0.8)
+
+```
+
+The number of interactions can be affected by the number of the cells in the FOV since it is just calculated by the number of the interactions. The weights are a better way to look at the strong interactions between cell types. Although it is hard to understand these plots when there is too many cell types. We can plot them individually:
+
+```{r, fig.width=10, fig.height=10}
+mat <- cellchat@net$weight
+par(mfrow = c(3,4), xpd=TRUE)
+
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  if (all(mat2 == 0)) {
+    #do nothing
+  } 
+  else{ 
+    p3 <- netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i],vertex.label.cex=1 )
+  }
+}
+
+
+
+```
+
+**We can look at the interaction strength in a more compact way using a heatmap:**
+
+Here we can see that the fibroblasts have a strong interaction between different types of cells.
+
+```{r,fig.width=6, fig.height=6}
+
+netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Reds")
+
+```
+
+#### Visualization of specific pathways
+
+We can also do various plots focusing on specific pathways. To select an interesting pathway we can do a further investigation on the data.
+
+```{r}
+# available pathways in our data
+print(cellchat@netP$pathways)
+```
+
+```{r}
+# adding the slot name will give us a list of significant pathways 
+df.net <- subsetCommunication(cellchat, slot.name = "netP")
+head(df.net)
+```
+
+The following table will give us the number of pathway occurances in our interactions. The most prominent pathway in our data is Collagen, it probably originates from the high fibroblast population in this FOV.
+
+```{r}
+# Calculate the distribution of pathways
+pathway_distribution <- table(df.net$pathway_name)
+pathway_df <- as.data.frame(pathway_distribution)
+colnames(pathway_df) <- c("pathway_name", "count")
+pathway_df <- pathway_df[order(-pathway_df$count), ]
+head(pathway_df)
+
+```
+
+We can further investigate which cell types are prominant in our top 100 most probable pathways
+
+```{r}
+
+df.net <- df.net[order(-df.net$prob), ]
+df.net$cell_type_pair_source <- paste("Source-", df.net$source)
+df.net$cell_type_pair_target <- paste ("Target-", df.net$target)
+top_100_pathways <- head(df.net, 100)
+head(top_100_pathways)
+
+# Count the occurrences of each cell type as a source
+source_counts <- as.data.frame(table(top_100_pathways$source))
+colnames(source_counts) <- c("cell_type", "count")
+
+# Count the occurrences of each cell type as a target
+target_counts <- as.data.frame(table(top_100_pathways$target))
+colnames(target_counts) <- c("cell_type", "count")
+```
+
+```{r}
+
+p1 <- ggplot(source_counts, aes(x = reorder(cell_type, -count), y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8)) +
+  labs(title = "Count of Each Cell Type as Source",
+       x = "Source Cell Type",
+       y = "Count")
+
+p2 <- ggplot(target_counts, aes(x = reorder(cell_type, -count), y = count)) +
+  geom_bar(stat = "identity", fill = "salmon") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8)) +
+  labs(title = "Count of Each Cell Type as Target",
+       x = "Target Cell Type",
+       y = "Count")
+
+p1+p2
+```
+
+It seems to be Fibroblasts are sending most of the signals in top 100 pathways where Cytotoxic CD8's are the most prominent receiver. I am mostly interested in the **Clu+S100B+ cell type** but you can pick the one you might be more interested in. So I will focus on the pathways unique to that cell type.
+
+```{r}
+# Filter rows where Clu+S100B+ is either the source or target
+clu_s100b_interactions <- subset(df.net, source == "Clu+S100B+" | target == "Clu+S100B+")
+
+# Identify unique pathways involving Clu+S100B+
+unique_pathways <- unique(clu_s100b_interactions$pathway_name)
+
+# Filter the original data frame for these pathways
+pathway_in_all <- subset(df.net, pathway_name %in% unique_pathways)
+
+# Count the occurrences of each pathway across all interactions
+pathway_counts <- table(pathway_in_all$pathway_name)
+
+# Identify pathways that only occur in interactions involving Clu+S100B+
+unique_to_clu_s100b <- names(pathway_counts[pathway_counts == table(clu_s100b_interactions$pathway_name)])
+
+# Display the unique pathways
+unique_to_clu_s100b
+
+```
+
+In ANGPTL pathway my target cell type is a source, but in LIFR it is a target. So we will focus on these pathways for the next few plots.
+
+```{r,fig.width=6, fig.height=6}
+pathways.show <- c("ANGPTL") 
+P1 <- netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord")
+
+pathways.show <- c("LIFR") 
+P2 <- netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord")
+```
+
+In this chord plot we see something interesting, the LIFR pathway is only received from 2 tumor types that we have in the data but the cell type looks like to be the source of ANGPTL pathway. We can also look at this data using a heatmap. From this perspective LIFR seems to have a higher probability in TP53+ tumor type than LYZ+. In ANGPTL pathway the strongest receiver is endothelial.
+
+```{r}
+pathways.show <- c("ANGPTL") 
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+
+pathways.show <- c("LIFR") 
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+
+```
+
+This two pathways turned out to be mediated by single ligand-receptor pair. If there were more ligand-receptor pairs involved with our target pathway we can explore and plot them individually as the following:
+
+```{r, fig.width=6, fig.height=6}
+pathways.show <- c("ANGPTL") 
+par(mfrow = c(1,2), xpd=TRUE)
+netAnalysis_contribution(cellchat, signaling = pathways.show)
+
+# we can also plot specific LR pairs in the pathways
+pairLR.CXCL <- extractEnrichedLR(cellchat, signaling = pathways.show, geneLR.return = FALSE)
+LR.show <- pairLR.CXCL[1,] # to show only 1 pair but we already have 1 
+
+netVisual_individual(cellchat, signaling = pathways.show, pairLR.use = LR.show, layout = "chord") # you can plot different L-R pairs if you have multiple in 1 pathway. 
+
+```
+
+```{r, fig.width=6, fig.height=6}
+
+pathways.show <- c("LIFR") 
+par(mfrow = c(1,2), xpd=TRUE)
+netAnalysis_contribution(cellchat, signaling = pathways.show)
+
+# we can also plot specific LR pairs in the pathways
+pairLR.CXCL <- extractEnrichedLR(cellchat, signaling = pathways.show, geneLR.return = FALSE)
+LR.show <- pairLR.CXCL[1,] # to show only 1 pair but we already have 1 
+
+p1 <- netVisual_individual(cellchat, signaling = pathways.show, pairLR.use = LR.show, layout = "chord") # you can plot different L-R pairs if you have multiple in 1 pathway.
+```
+
+#### Spatial specific plots for signaling networks and ligand-receptor pairs
+
+Cell-chat offers some plots specifically for spatial data. These might be useful to combine the interactions with the spatial locations. I am investigating the NGF pathway further. As can be seen from the plot below, the pathway is highly localized to the Clu+S100B+ region.
+
+```{r, fig.width=10, fig.height=10}
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial", edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 3.5)
+```
+
+Another spatial plotting CellChat offers is similar to Seurat, however it allows us to see where L-R pairs are localized and distributed. First we can plot the features to highlight the cell types of interest. As markers I have used S100B for my specific cell type and KRT8 for cancer. Since the plots by CellChat is not identical to Seurat plots it is good to recall the spatial structure.
+
+Later, I used LIF and NGF pathways' singular LR pairs. Neither of the pairs exhibited a clear spatial localization between cells, meaning their signaling interactions were not concentrated in a specific area. Only NGFR seems to be highly localized next to the S100B hub, where KLK3's are inside of these hubs. However, the numbers are extremely low.
+
+```{r,fig.width=5, fig.height=5}
+spatialFeaturePlot(cellchat, features = c("S100B"), point.size = 0.8, color.heatmap = "Reds", direction = 1)
+spatialFeaturePlot(cellchat, features = c("KRT8"), point.size = 0.8, color.heatmap = "Reds", direction = 1)
+spatialFeaturePlot(cellchat, pairLR.use = "LIF_LIFR_IL6ST", point.size = 0.8, do.binary = TRUE, cutoff = 0.05, enriched.only = T, color.heatmap = "Reds", direction = 1)
+spatialFeaturePlot(cellchat, pairLR.use = "KLK3_NGFR", point.size = 0.8, do.binary = TRUE, cutoff = 0.05, enriched.only = F, color.heatmap = "Reds", direction = 1)
+```
+
+#### Plotting multiple ligand-receptor pairs
+
+We can continue our analysis and check out some pathways that include multiple LR pairs. The functions in cellchat usually takes in the ident levels as a input if you want to subset a specific cell type. Our current numbers are given below:
+
+```{r}
+
+# This is what cellchat uses as entries to specifiy different cell types 
+print(levels(cellchat@idents))
+```
+
+Bubbleplot is a popular way to show LR pairs over interactions. We start by focusing chemokine signaling from CLU+S100B+ cell type to any other cell. There seems to only 1 significant one. CCL2-CCR2 between Naive CD8s.
+
+Next thing we wanted to look at how CLU+S100B+ cell type interacts with EMT-related pathways. Here a list of interesting pathways are given to this function where the cell type defined as the source and the target. In NGF pathway there is only one L-R pair exists. KLK3 ligand from tumor signaling NGFR in fibroblasts.
+
+```{r,fig.width=5, fig.height=5}
+# Now we can see all of the ligand-receptor pairs coming from S100B to all targets specifically in CCL and CXCL signaling. 
+
+netVisual_bubble(cellchat, sources.use = 17, targets.use = c(1:21), signaling = c("CCL","CXCL"), remove.isolate = FALSE)
+
+netVisual_bubble(cellchat, sources.use = c(6, 3, 10, 15, 17), targets.use = c(17), remove.isolate = TRUE, signaling = c("TGFb","ncWNT","NOTCH","FGF","HGF","VEGF","IL6"))
+
+netVisual_bubble(cellchat, sources.use = c(17), targets.use = c(6, 3, 10, 15, 17), remove.isolate = TRUE, signaling = c("TGFb","ncWNT","NOTCH","FGF","HGF","VEGF","IL6"))
+
+netVisual_bubble(cellchat, sources.use = c(1:21), targets.use = c(1:21), remove.isolate = TRUE, signaling = c("NGF"))
+
+```
+
+#### Systems analysis of cell-cell communication network
+
+System analysis of individual pathway types in CellChat fully depends on graph theory:
+
+**Centrality** of a node is the number of direct connections it has to the other nodes. The nodes that has higher centrality are "hubs" meaning that they are important for the graph's integrity.
+
+**In-Degree** is the number of incoming edges to a cell type. "Receiver"
+
+**Out-Degree** is the number of outgoing edges to a cell type. "Sender"
+
+**We can plot these classifications over different pathways using heatmaps:**
+
+In NGF pathway, the sender is the tumor cell whereas receivers are fibroblasts and Clu+S100B+. In LIFR Clu+S100B+ seems to be the only receiver where TP53+ tumor is the stronger sender. In ANGPTL pathway, only sender is Clu+S100B+ and there are multiple cell types recieving and playing the influencer.
+
+```{r}
+pathways.show= c("NGF", "LIFR","ANGPTL")
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP") 
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+```
+
+**Other way to show the targets and sources would be a scatter graph like the following:**
+
+To take a different approach we can group the pathways into their Cellchat databases:
+
+```{r}
+
+df.net <- subsetCommunication(cellchat)
+secreted_signaling_pathways <- unique(df.net$pathway_name[df.net$annotation == "Secreted Signaling"])
+
+# ECM-Receptor pathways
+ecm_receptor_pathways <- unique(df.net$pathway_name[df.net$annotation == "ECM-Receptor"])
+
+# Cell-Cell Contact pathways
+cell_cell_contact_pathways <- unique(df.net$pathway_name[df.net$annotation == "Cell-Cell Contact"])
+```
+
+All datasets are highly skewed by fibroblast cell type dominating the ECM receptor subset. Even though they don't have much signaling power in secreting pathways, similar to their functions, they show a high activity of ECM receptor signaling. Cytotoxic CD8's are prominent receivers.
+
+```{r,fig.width=10, fig.height=5, warning=FALSE}
+gg1 <- netAnalysis_signalingRole_scatter(cellchat, title = "All Datasets")
+gg2 <- netAnalysis_signalingRole_scatter(cellchat, signaling = secreted_signaling_pathways, title = "Secreted Signaling")
+gg3 <- netAnalysis_signalingRole_scatter(cellchat, signaling = ecm_receptor_pathways, title = "ECM receptor")
+gg1+gg2+gg3
+
+```
+
+**The following heatmaps can be a good summary table for the whole data.** We can visualize the top pathways over the cell types that are signaling/receiving them.
+
+```{r}
+# this is a big figure so I would recommend saving it to a PDF file. 
+
+pdf("outgoing.pdf", height=30)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", font.size=6, height=20)
+dev.off()
+
+
+```
+
+```{r}
+# this is a big figure so I would recommend saving it to a PDF file. 
+
+pdf("incoming.pdf", height=30)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", font.size=6, height=20)
+dev.off()
+```
+
+#### How multiple cell types and signaling pathways are coordinating together
+
+One of the most valuable insights from CellChat is its ability to reveal **communication communities** among cell types. By grouping different cell populations based on their signaling activities, CellChat identifies **functional signaling networks**---for example, Immune Communication Network or Tumor-Stroma Interaction Network. These networks represent clusters of cell types and pathways that are actively coordinating together to drive specific biological functions within the tissue, such as immune responses, tissue remodeling, or tumor progression.
+
+To create cell type groups they use nearest-k neighbors and decide on the k based on cophenetic and silhouette score. The cophenetic score evaluates **how well the hierarchical clustering structure is preserved** in the clustering result. The silhouette score measures **how well-separated the clusters are** by calculating the average distance between points within the same cluster versus points in other clusters.
+
+**The point where both of these values decline would be a good choice. Which is around 4 this time.**
+
+```{r}
+# We run this function to decide on the k number, it might take long. 
+p1 <- selectK(cellchat, pattern = "outgoing")
+p1
+```
+
+The first plot shows the patterns in **outgoing**, which is the signaling patterns. The pattern 1 consists of tumor cells, pattern 2 is mostly immune, pattern 3 is endothelial-MDSC and pattern 4 could be the similar signaling cells shared between Fibroblasts and S100B+. We can see the pathways that brought these cell types together next to it.
+
+```{r, fig.height=10, fig.width=10}
+nPatterns = 4
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns, heatmap.show = TRUE, height=18, width=5)
+```
+
+**This is just another way to show the same thing:**
+
+```{r}
+netAnalysis_river(cellchat, pattern = "outgoing")
+```
+
+Now let's do it for incoming part of the data.
+
+```{r}
+g1 <- selectK(cellchat, pattern = "incoming")
+g1
+```
+
+There is definitely a difference between incoming and outgoing signals. The incoming signals tends to be more specific to cell types rather than different types of cells grouped together.
+
+```{r, fig.height=10, fig.width=10}
+nPatterns = 6
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns, heatmap.show = TRUE, height=18, width=5)
+```
+
+```{r}
+netAnalysis_river(cellchat, pattern = "incoming")
+```
+
+## Summary
+
+This analysis demonstrates the utility of CellChat in uncovering complex cell-cell communication networks within the spatial context provided by CosMX spatial transcriptomics data. By categorizing and quantifying signaling interactions, CellChat provides insights into how different cell types coordinate through specific pathways to establish functional microenvironments within the tissue. This specific dataset produced very low probability interactions possibly due to the number of cells in singular FOV. Doing a FOV vs FOV analysis or a specific condition's broader analysis could produce more significant results.
